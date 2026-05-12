@@ -2,6 +2,7 @@ import json
 import math
 import os
 import sys
+from io import BytesIO
 from dataclasses import dataclass
 
 import pygame
@@ -38,6 +39,135 @@ GAP = 18
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("VectorLab Studio")
 clock = pygame.time.Clock()
+
+class MathSurfaceRenderer:
+    def __init__(self):
+        self.available = None
+        self._figure_class = None
+        self._canvas_class = None
+        self._cache = {}
+
+    def ensure_backend(self):
+        if self.available is not None:
+            return self.available
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+        except ImportError:
+            self.available = False
+            return False
+        self._figure_class = Figure
+        self._canvas_class = FigureCanvasAgg
+        self.available = True
+        return True
+
+    def render_block(self, formulas, max_width, max_height, color):
+        formulas = [formula for formula in formulas if formula]
+        if not formulas:
+            return None
+        cache_key = (tuple(formulas), max_width, max_height, color)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if not self.ensure_backend():
+            panel = self.render_fallback(formulas, max_width, max_height, color)
+            self._cache[cache_key] = panel
+            return panel
+
+        font_size = self.pick_font_size(formulas, max_width, max_height)
+        surfaces = []
+        total_height = 0
+        max_surface_width = 0
+        for formula in formulas:
+            surface = self.render_formula(formula, font_size, color)
+            if surface is None:
+                continue
+            surfaces.append(surface)
+            total_height += surface.get_height()
+            max_surface_width = max(max_surface_width, surface.get_width())
+
+        if not surfaces:
+            panel = self.render_fallback(formulas, max_width, max_height, color)
+            self._cache[cache_key] = panel
+            return panel
+
+        spacing = 8
+        total_height += spacing * (len(surfaces) - 1)
+        panel = pygame.Surface((max_surface_width, total_height), pygame.SRCALPHA)
+        y = 0
+        for surface in surfaces:
+            panel.blit(surface, (0, y))
+            y += surface.get_height() + spacing
+
+        if panel.get_width() > max_width or panel.get_height() > max_height:
+            scale = min(max_width / max(1, panel.get_width()), max_height / max(1, panel.get_height()))
+            scaled_size = (
+                max(1, int(panel.get_width() * scale)),
+                max(1, int(panel.get_height() * scale)),
+            )
+            panel = pygame.transform.smoothscale(panel, scaled_size)
+        self._cache[cache_key] = panel
+        return panel
+
+    def pick_font_size(self, formulas, max_width, max_height):
+        for font_size in range(28, 11, -2):
+            widths = []
+            heights = []
+            for formula in formulas:
+                size = self.measure_formula(formula, font_size)
+                if size is None:
+                    return 20
+                widths.append(size[0])
+                heights.append(size[1])
+            total_height = sum(heights) + 8 * (len(heights) - 1)
+            if max(widths) <= max_width and total_height <= max_height:
+                return font_size
+        return 12
+
+    def measure_formula(self, formula, font_size):
+        try:
+            figure = self._figure_class(figsize=(1, 1), dpi=200)
+            canvas = self._canvas_class(figure)
+            text = figure.text(0, 0, formula, fontsize=font_size)
+            canvas.draw()
+            bbox = text.get_window_extent(canvas.get_renderer())
+            return math.ceil(bbox.width), math.ceil(bbox.height)
+        except Exception:
+            return None
+
+    def render_formula(self, formula, font_size, color):
+        try:
+            width, height = self.measure_formula(formula, font_size)
+            if width is None or height is None:
+                return None
+            figure = self._figure_class(figsize=(width / 200, height / 200), dpi=200)
+            figure.patch.set_alpha(0)
+            canvas = self._canvas_class(figure)
+            rgb = tuple(channel / 255 for channel in color)
+            figure.text(0, 0, formula, fontsize=font_size, color=rgb)
+            image = BytesIO()
+            canvas.print_png(image)
+            image.seek(0)
+            return pygame.image.load(image, "math.png").convert_alpha()
+        except Exception:
+            return None
+
+    def render_fallback(self, formulas, max_width, max_height, color):
+        lines = [clipped_text(formula.strip("$"), FONT_SM, max_width) for formula in formulas]
+        rendered = [FONT_SM.render(line, True, color) for line in lines]
+        total_height = sum(surface.get_height() for surface in rendered) + 6 * max(0, len(rendered) - 1)
+        panel = pygame.Surface((max(surface.get_width() for surface in rendered), total_height), pygame.SRCALPHA)
+        y = 0
+        for surface in rendered:
+            panel.blit(surface, (0, y))
+            y += surface.get_height() + 6
+        if panel.get_width() > max_width or panel.get_height() > max_height:
+            scale = min(max_width / max(1, panel.get_width()), max_height / max(1, panel.get_height()))
+            panel = pygame.transform.smoothscale(
+                panel,
+                (max(1, int(panel.get_width() * scale)), max(1, int(panel.get_height() * scale))),
+            )
+        return panel
 
 
 class Color:
@@ -115,12 +245,14 @@ FONT_MD = pygame.font.SysFont("Segoe UI", 17)
 FONT_LG = pygame.font.SysFont("Segoe UI Semibold", 22)
 FONT_TITLE = pygame.font.SysFont("Segoe UI Semibold", 29)
 FONT_MONO = pygame.font.SysFont("Consolas", 15)
+FONT_FORMULA_TITLE = pygame.font.SysFont("Cambria Math", 15, bold=True)
 
 LEFT_PANEL = pygame.Rect(GAP, GAP, SIDEBAR_W, HEIGHT - 2 * GAP)
 RIGHT_PANEL = pygame.Rect(WIDTH - INSPECTOR_W - GAP, GAP, INSPECTOR_W, HEIGHT - 2 * GAP)
 TOP_BAR = pygame.Rect(LEFT_PANEL.right + GAP, GAP, RIGHT_PANEL.left - LEFT_PANEL.right - 2 * GAP, 74)
 CANVAS = pygame.Rect(LEFT_PANEL.right + GAP, TOP_BAR.bottom + GAP, TOP_BAR.w, HEIGHT - TOP_BAR.bottom - 2 * GAP)
 CLIP_RECT = pygame.Rect(CANVAS.x + 160, CANVAS.y + 96, CANVAS.w - 320, CANVAS.h - 192)
+MATH_RENDERER = MathSurfaceRenderer()
 
 
 DRAW_TOOLS = [
@@ -184,6 +316,26 @@ class Button:
         screen.blit(label_surf, label_surf.get_rect(midleft=(self.rect.x + 50, self.rect.centery)))
 
 
+@dataclass
+class AlgorithmPreview:
+    shape: dict
+    title: str
+    equations: list
+    render_method: str
+    headers: list
+    rows: list
+    pixels: list
+    color_name: str
+    started_at: int = 0
+    scroll: int = 0
+    h_scroll: int = 0
+    follow_latest: bool = True
+    equation_surface: object = None
+    equation_size: tuple = (0, 0)
+    equation_color: tuple = None
+
+
+
 def draw_text(text, pos, font=FONT_SM, color=Color.TEXT):
     surf = font.render(text, True, color)
     screen.blit(surf, pos)
@@ -193,6 +345,378 @@ def draw_text(text, pos, font=FONT_SM, color=Color.TEXT):
 def draw_panel(rect):
     pygame.draw.rect(screen, Color.PANEL, rect, border_radius=10)
     pygame.draw.rect(screen, Color.BORDER, rect, 1, border_radius=10)
+
+
+def clipped_text(text, font, max_width):
+    text = str(text)
+    if font.size(text)[0] <= max_width:
+        return text
+    suffix = "..."
+    available = max_width - font.size(suffix)[0]
+    clipped = ""
+    for char in text:
+        if font.size(clipped + char)[0] > available:
+            break
+        clipped += char
+    return clipped + suffix
+
+
+def wrap_text_lines(text, font, max_width, max_lines=3):
+    words = str(text).split()
+    if not words:
+        return [""]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if font.size(trial)[0] <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) == max_lines - 1:
+                break
+    if len(lines) < max_lines:
+        remaining = current if len(lines) < max_lines - 1 else clipped_text(current, font, max_width)
+        lines.append(remaining)
+    return lines[:max_lines]
+
+
+def ordered_unique(points):
+    seen = set()
+    result = []
+    for point in points:
+        key = (int(round(point[0])), int(round(point[1])))
+        if key not in seen:
+            seen.add(key)
+            result.append(key)
+    return result
+
+
+def trace_dda_pixels(x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    steps = int(max(abs(dx), abs(dy)))
+    if steps == 0:
+        pixel = (round(x1), round(y1))
+        return [["0", f"{x1:.2f}", f"{y1:.2f}", pixel]], [pixel]
+
+    x_inc = dx / steps
+    y_inc = dy / steps
+    x = x1
+    y = y1
+    rows = []
+    pixels = []
+    for step in range(steps + 1):
+        pixel = (round(x), round(y))
+        rows.append([step, f"{x:.2f}", f"{y:.2f}", pixel])
+        pixels.append(pixel)
+        x += x_inc
+        y += y_inc
+    return rows, ordered_unique(pixels)
+
+
+def trace_bresenham_pixels(x1, y1, x2, y2):
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+    sx = 1 if x1 < x2 else -1
+    sy = 1 if y1 < y2 else -1
+    err = dx - dy
+    rows = []
+    pixels = []
+    step = 0
+    while True:
+        pixels.append((x1, y1))
+        rows.append([step, x1, y1, err, 2 * err])
+        if x1 == x2 and y1 == y2:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x1 += sx
+        if e2 < dx:
+            err += dx
+            y1 += sy
+        step += 1
+    return rows, pixels
+
+
+def circle_octant_pixels(xc, yc, x, y):
+    return [
+        (xc + x, yc + y),
+        (xc - x, yc + y),
+        (xc + x, yc - y),
+        (xc - x, yc - y),
+        (xc + y, yc + x),
+        (xc - y, yc + x),
+        (xc + y, yc - x),
+        (xc - y, yc - x),
+    ]
+
+
+def trace_midpoint_circle_pixels(xc, yc, r):
+    x = 0
+    y = r
+    p = 1 - r
+    rows = []
+    pixels = []
+    step = 0
+    while x <= y:
+        octants = circle_octant_pixels(xc, yc, x, y)
+        rows.append([step, x, y, p, str(octants)])
+        pixels.extend(octants)
+        x += 1
+        if p < 0:
+            p += 2 * x + 1
+        else:
+            y -= 1
+            p += 2 * (x - y) + 1
+        step += 1
+    return rows, ordered_unique(pixels)
+
+
+def trace_bresenham_circle_pixels(xc, yc, r):
+    x = 0
+    y = r
+    d = 3 - 2 * r
+    rows = []
+    pixels = []
+    step = 0
+    while x <= y:
+        octants = circle_octant_pixels(xc, yc, x, y)
+        rows.append([step, x, y, d, str(octants)])
+        pixels.extend(octants)
+        if d < 0:
+            d += 4 * x + 6
+        else:
+            d += 4 * (x - y) + 10
+            y -= 1
+        x += 1
+        step += 1
+    return rows, ordered_unique(pixels)
+
+
+def polyline_pixels(points, closed=False):
+    if len(points) < 2:
+        return []
+    pixels = []
+    pairs = list(zip(points, points[1:]))
+    if closed:
+        pairs.append((points[-1], points[0]))
+    for start, end in pairs:
+        _, segment = trace_dda_pixels(start.x, start.y, end.x, end.y)
+        pixels.extend(segment)
+    return ordered_unique(pixels)
+
+
+def trace_bezier_shape(points):
+    rows = []
+    curve_points = []
+    step = 0
+    t = 0
+    while t <= 1.0001:
+        p = draw_bezier_point(points, t)
+        rows.append([step, f"{t:.2f}", f"{p.x:.2f}", f"{p.y:.2f}", (round(p.x), round(p.y))])
+        curve_points.append(p)
+        t += 0.02
+        step += 1
+    return rows, polyline_pixels(curve_points)
+
+
+def draw_bezier_point(points, t):
+    n = len(points) - 1
+    x = 0
+    y = 0
+    for i, p in enumerate(points):
+        coeff = math.factorial(n) // (math.factorial(i) * math.factorial(n - i))
+        blend = coeff * ((1 - t) ** (n - i)) * (t ** i)
+        x += blend * p.x
+        y += blend * p.y
+    return Point(x, y)
+
+
+def trace_bspline_shape(points):
+    n = len(points)
+    k = 3
+    knots = list(range(n + k))
+    rows = []
+    curve_points = []
+    step = 0
+    t = k - 1
+    while t < n:
+        x = 0
+        y = 0
+        for i in range(n):
+            b = bspline_basis_value(i, k, t, knots)
+            x += points[i].x * b
+            y += points[i].y * b
+        rows.append([step, f"{t:.2f}", f"{x:.2f}", f"{y:.2f}", (round(x), round(y))])
+        curve_points.append(Point(x, y))
+        t += 0.04
+        step += 1
+    return rows, polyline_pixels(curve_points)
+
+
+def bspline_basis_value(i, k, t, knots):
+    if k == 1:
+        return 1 if knots[i] <= t < knots[i + 1] else 0
+    left = 0
+    right = 0
+    d1 = knots[i + k - 1] - knots[i]
+    if d1 != 0:
+        left = ((t - knots[i]) / d1) * bspline_basis_value(i, k - 1, t, knots)
+    d2 = knots[i + k] - knots[i + 1]
+    if d2 != 0:
+        right = ((knots[i + k] - t) / d2) * bspline_basis_value(i + 1, k - 1, t, knots)
+    return left + right
+
+
+def build_algorithm_preview(mode, shape, original_points=None):
+    color_name = DRAW_TOOL_BY_MODE[mode][5]
+    if mode == "DDA":
+        rows, pixels = trace_dda_pixels(shape["x1"], shape["y1"], shape["x2"], shape["y2"])
+        return AlgorithmPreview(
+            shape,
+            "DDA Line Algorithm",
+            [
+                r"$\mathrm{Digital\ Differential\ Analyzer\ Line}$",
+                r"$x_k = x_1 + k \left(\frac{\Delta x}{N}\right)$",
+                r"$y_k = y_1 + k \left(\frac{\Delta y}{N}\right), \quad N = \max \left(|\Delta x|, |\Delta y|\right)$",
+            ],
+            "Used Digital Differential Analyzer algorithm to draw the line.",
+            ["k", "x", "y", "pixel"],
+            rows,
+            pixels,
+            color_name,
+        )
+    if mode == "Bresenham":
+        rows, pixels = trace_bresenham_pixels(shape["x1"], shape["y1"], shape["x2"], shape["y2"])
+        return AlgorithmPreview(
+            shape,
+            "Bresenham Line Algorithm",
+            [
+                r"$\mathrm{Bresenham\ Line\ Decision\ Parameter}$",
+                r"$p_0 = 2\Delta y - \Delta x$",
+                r"$p_{k+1} = p_k + 2\Delta y \quad \mathrm{or} \quad p_k + 2\Delta y - 2\Delta x$",
+            ],
+            "Used Bresenham line algorithm to draw the line.",
+            ["k", "x", "y", "err", "2err"],
+            rows,
+            pixels,
+            color_name,
+        )
+    if mode == "Midpoint Circle":
+        rows, pixels = trace_midpoint_circle_pixels(shape["xc"], shape["yc"], shape["r"])
+        return AlgorithmPreview(
+            shape,
+            "Midpoint Circle Algorithm",
+            [
+                r"$\mathrm{Midpoint\ Circle\ Equation:}\ x^2 + y^2 = r^2$",
+                r"$F(x,y) = x^2 + y^2 - r^2$",
+                r"$p_0 = 1 - r,\quad p_k = F(x_k + 1,\ y_k - \frac{1}{2})$",
+            ],
+            "Used Midpoint Circle algorithm to draw the circle.",
+            ["k", "x", "y", "p", "8 symmetric pixels"],
+            rows,
+            pixels,
+            color_name,
+        )
+    if mode == "Bresenham Circle":
+        rows, pixels = trace_bresenham_circle_pixels(shape["xc"], shape["yc"], shape["r"])
+        return AlgorithmPreview(
+            shape,
+            "Bresenham Circle Algorithm",
+            [
+                r"$\mathrm{Bresenham\ Circle\ Equation:}\ x^2 + y^2 = r^2$",
+                r"$d_0 = 3 - 2r$",
+                r"$d_{k+1} = d_k + 4x_k + 6 \quad \mathrm{or} \quad d_k + 4(x_k - y_k) + 10$",
+            ],
+            "Used Bresenham circle algorithm to draw the circle.",
+            ["k", "x", "y", "d", "8 symmetric pixels"],
+            rows,
+            pixels,
+            color_name,
+        )
+    if mode == "Bezier":
+        rows, pixels = trace_bezier_shape(shape["points"])
+        return AlgorithmPreview(
+            shape,
+            "Bezier Curve Algorithm",
+            [
+                r"$\mathrm{B\acute{e}zier\ Curve}$",
+                r"$B(t)=\sum_{i=0}^{n} B_{i,n}(t)P_i$",
+                r"$B_{i,n}(t)=\binom{n}{i}(1-t)^{n-i}t^i$",
+            ],
+            "Used Digital Differential Analyzer algorithm between successive Bezier sample points.",
+            ["k", "t", "x", "y", "pixel"],
+            rows,
+            pixels,
+            color_name,
+        )
+    if mode == "B-Spline":
+        rows, pixels = trace_bspline_shape(shape["points"])
+        return AlgorithmPreview(
+            shape,
+            "B-Spline Algorithm",
+            [
+                r"$\mathrm{B\!-\!Spline\ Curve}$",
+                r"$P(t)=\sum_{i=0}^{n}N_{i,k}(t)P_i$",
+                r"$N_{i,k}(t)=\frac{t-t_i}{t_{i+k-1}-t_i}N_{i,k-1}(t)+\frac{t_{i+k}-t}{t_{i+k}-t_{i+1}}N_{i+1,k-1}(t)$",
+            ],
+            "Used Digital Differential Analyzer algorithm between successive B-spline sample points.",
+            ["k", "t", "x", "y", "pixel"],
+            rows,
+            pixels,
+            color_name,
+        )
+    if mode == "Clip Line":
+        rows = [["input", original_points[0], original_points[1], "clip window"], ["output", (shape["x1"], shape["y1"]), (shape["x2"], shape["y2"]), "accepted"]]
+        _, pixels = trace_dda_pixels(shape["x1"], shape["y1"], shape["x2"], shape["y2"])
+        return AlgorithmPreview(
+            shape,
+            "Cohen-Sutherland Line Clipping",
+            [
+                r"$\mathrm{Cohen\!-\!Sutherland\ Intersection}$",
+                r"$x=x_1+(x_2-x_1)\left(\frac{y_{\mathrm{boundary}}-y_1}{y_2-y_1}\right)$",
+                r"$y=y_1+(y_2-y_1)\left(\frac{x_{\mathrm{boundary}}-x_1}{x_2-x_1}\right)$",
+            ],
+            "Used Cohen-Sutherland clipping, then used Digital Differential Analyzer algorithm to draw the clipped line.",
+            ["step", "p1", "p2", "result"],
+            rows,
+            pixels,
+            color_name,
+        )
+    if mode == "Clip Polygon":
+        rows = [[index, f"{point.x:.0f}", f"{point.y:.0f}", "inside"] for index, point in enumerate(shape["points"])]
+        return AlgorithmPreview(
+            shape,
+            "Sutherland-Hodgman Polygon Clipping",
+            [
+                r"$\mathrm{Sutherland\!-\!Hodgman\ Intersection}$",
+                r"$x=x_1+(x_2-x_1)\left(\frac{y_{\mathrm{boundary}}-y_1}{y_2-y_1}\right)$",
+                r"$y=y_1+(y_2-y_1)\left(\frac{x_{\mathrm{boundary}}-x_1}{x_2-x_1}\right)$",
+            ],
+            "Used Sutherland-Hodgman clipping, then used Digital Differential Analyzer algorithm for polygon edges.",
+            ["vertex", "x", "y", "status"],
+            rows,
+            polyline_pixels(shape["points"], closed=True),
+            color_name,
+        )
+    rows = [[index, f"{point.x:.0f}", f"{point.y:.0f}", "connect"] for index, point in enumerate(shape["points"])]
+    return AlgorithmPreview(
+        shape,
+        "Polygon Edge Drawing",
+        [
+            r"$\mathrm{Polygon\ Edge\ Parametric\ Form}$",
+            r"$P(t)=P_i+t(P_{i+1}-P_i)$",
+            r"$0 \leq t \leq 1$",
+        ],
+        "Used Digital Differential Analyzer algorithm for the polygon edges.",
+        ["vertex", "x", "y", "action"],
+        rows,
+        polyline_pixels(shape["points"], closed=True),
+        color_name,
+    )
 
 
 class ShapeAPI:
@@ -268,32 +792,39 @@ class DrawingAPI:
         if mode in ("DDA", "Bresenham") and len(points) == 2:
             x1, y1 = points[0]
             x2, y2 = points[1]
-            self.add({"type": "dda" if mode == "DDA" else "bresenham", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+            self.preview({"type": "dda" if mode == "DDA" else "bresenham", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
         elif "Circle" in mode and len(points) == 2:
             xc, yc = points[0]
             x2, y2 = points[1]
             radius = int(math.hypot(x2 - xc, y2 - yc))
-            self.add({"type": "midpoint_circle" if mode == "Midpoint Circle" else "bresenham_circle", "xc": xc, "yc": yc, "r": radius})
+            self.preview({"type": "midpoint_circle" if mode == "Midpoint Circle" else "bresenham_circle", "xc": xc, "yc": yc, "r": radius})
         elif mode == "Polygon" and len(points) == 4:
-            self.add({"type": "polygon", "points": [Point(x, y) for x, y in points]})
+            self.preview({"type": "polygon", "points": [Point(x, y) for x, y in points]})
         elif mode == "Bezier" and len(points) == 4:
-            self.add({"type": "bezier", "points": [Point(x, y) for x, y in points]})
+            self.preview({"type": "bezier", "points": [Point(x, y) for x, y in points]})
         elif mode == "B-Spline" and len(points) == 4:
-            self.add({"type": "bspline", "points": [Point(x, y) for x, y in points]})
+            self.preview({"type": "bspline", "points": [Point(x, y) for x, y in points]})
         elif mode == "Clip Line" and len(points) == 2:
             x1, y1 = points[0]
             x2, y2 = points[1]
             result = cohen_sutherland_clip(x1, y1, x2, y2, CLIP_RECT.left, CLIP_RECT.top, CLIP_RECT.right, CLIP_RECT.bottom)
             if result:
                 x1, y1, x2, y2 = result
-                self.add({"type": "dda", "x1": x1, "y1": y1, "x2": x2, "y2": y2}, "Clipped line added")
+                self.preview({"type": "dda", "x1": x1, "y1": y1, "x2": x2, "y2": y2}, "Clipped line added")
             else:
                 self.app.pending_points.clear()
                 self.app.toast("Line rejected by clipping window")
         elif mode == "Clip Polygon" and len(points) == 4:
             poly = [Point(x, y) for x, y in points]
             clipped = clip_polygon(poly, CLIP_RECT.left, CLIP_RECT.top, CLIP_RECT.right, CLIP_RECT.bottom)
-            self.add({"type": "polygon", "points": clipped}, "Clipped polygon added")
+            self.preview({"type": "polygon", "points": clipped}, "Clipped polygon added")
+
+    def preview(self, shape, message=None):
+        self.app.preview_message = message
+        self.app.algorithm_preview = build_algorithm_preview(self.app.mode, shape, list(self.app.pending_points))
+        self.app.algorithm_preview.started_at = pygame.time.get_ticks()
+        self.app.pending_points.clear()
+        self.app.toast("Review algorithm steps")
 
     def add(self, shape, message=None):
         self.app.shapes.append(shape)
@@ -391,6 +922,7 @@ class Renderer:
         self.inspector(mouse_pos)
         self.compare_overlay()
         self.json_overlay()
+        self.algorithm_preview_overlay()
         pygame.display.update()
 
     def sidebar(self, mouse_pos):
@@ -592,6 +1124,190 @@ class Renderer:
             draw_text(line, (modal.x + 28, y), FONT_MONO, Color.TEXT)
             y += 26
 
+    def algorithm_preview_overlay(self):
+        preview = self.app.algorithm_preview
+        if preview is None:
+            return
+
+        now = pygame.time.get_ticks()
+        elapsed = now - preview.started_at
+        row_interval = max(12, min(95, 4000 // max(1, len(preview.rows))))
+        pixel_interval = max(2, min(10, 4000 // max(1, len(preview.pixels))))
+        row_count = min(len(preview.rows), max(1, elapsed // row_interval + 1))
+        pixel_count = min(len(preview.pixels), max(1, elapsed // pixel_interval + 1))
+
+        veil = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        veil.fill((15, 23, 42, 155))
+        screen.blit(veil, (0, 0))
+
+        modal = pygame.Rect(92, 54, WIDTH - 184, HEIGHT - 108)
+        top_panel_h = 140
+        equation_panel = pygame.Rect(modal.x + 24, modal.y + 22, modal.w - 300, top_panel_h)
+        method_panel = pygame.Rect(equation_panel.right + 24, modal.y + 22, modal.right - equation_panel.right - 48, top_panel_h)
+        equation_rect = pygame.Rect(equation_panel.x + 16, equation_panel.y + 36, equation_panel.w - 32, equation_panel.h - 46)
+        method_rect = pygame.Rect(method_panel.x + 16, method_panel.y + 36, method_panel.w - 32, method_panel.h - 46)
+        table_rect = pygame.Rect(modal.x + 24, equation_panel.bottom + 16, 610, modal.bottom - equation_panel.bottom - 40)
+        pixel_rect = pygame.Rect(table_rect.right + 24, table_rect.y, modal.right - table_rect.right - 48, table_rect.h)
+
+        pygame.draw.rect(screen, Color.FIELD, modal, border_radius=10)
+        pygame.draw.rect(screen, Color.BORDER, modal, 1, border_radius=10)
+        pygame.draw.rect(screen, Color.PANEL, equation_panel, border_radius=8)
+        pygame.draw.rect(screen, Color.BORDER, equation_panel, 1, border_radius=8)
+        pygame.draw.rect(screen, Color.PANEL, method_panel, border_radius=8)
+        pygame.draw.rect(screen, Color.BORDER, method_panel, 1, border_radius=8)
+
+        draw_text(preview.title, (equation_panel.x + 14, equation_panel.y + 10), FONT_FORMULA_TITLE, Color.TEXT)
+        equation_bounds = (equation_rect.w, equation_rect.h)
+        if preview.equation_surface is None or preview.equation_size != equation_bounds or preview.equation_color != Color.CYAN:
+            preview.equation_surface = MATH_RENDERER.render_block(
+                preview.equations,
+                equation_bounds[0],
+                equation_bounds[1],
+                Color.CYAN,
+            )
+            preview.equation_size = equation_bounds
+            preview.equation_color = Color.CYAN
+        equation_surface = preview.equation_surface
+        if equation_surface is not None:
+            equation_x = equation_rect.x
+            equation_y = equation_rect.y + max(0, (equation_rect.h - equation_surface.get_height()) // 2)
+            screen.blit(equation_surface, (equation_x, equation_y))
+
+        draw_text("Rendering Method", (method_panel.x + 14, method_panel.y + 10), FONT_FORMULA_TITLE, Color.MUTED)
+        method_lines = wrap_text_lines(preview.render_method, FONT_SM, method_rect.w, max_lines=3)
+        method_y = method_rect.y + 18
+        for line in method_lines:
+            draw_text(line, (method_rect.x, method_y), FONT_SM, Color.TEXT)
+            method_y += 20
+        draw_text("Esc to draw", (modal.right - 96, modal.bottom - 28), FONT_XS, Color.MUTED)
+
+        pygame.draw.rect(screen, Color.PANEL, table_rect, border_radius=8)
+        pygame.draw.rect(screen, Color.BORDER, table_rect, 1, border_radius=8)
+        pygame.draw.rect(screen, Color.PANEL, pixel_rect, border_radius=8)
+        pygame.draw.rect(screen, Color.BORDER, pixel_rect, 1, border_radius=8)
+
+        self.draw_preview_table(preview, table_rect, row_count)
+        self.draw_preview_pixels(preview, pixel_rect, pixel_count)
+
+    def draw_preview_table(self, preview, rect, row_count):
+        col_count = len(preview.headers)
+        scrollbar_w = 16
+        viewport_w = rect.w - 32 - scrollbar_w
+        col_widths = self.preview_column_widths(preview)
+        content_w = sum(col_widths)
+        max_h_scroll = max(0, content_w - viewport_w)
+        preview.h_scroll = max(0, min(preview.h_scroll, max_h_scroll))
+        y = rect.y + 16
+        x = rect.x + 16 - preview.h_scroll
+        old_clip = screen.get_clip()
+        clip_rect = pygame.Rect(rect.x + 16, rect.y + 8, viewport_w, rect.h - 46)
+        screen.set_clip(clip_rect)
+
+        col_x = x
+        for index, header in enumerate(preview.headers):
+            col_w = col_widths[index]
+            label = clipped_text(header, FONT_XS, col_w - 10)
+            draw_text(label, (col_x, y), FONT_XS, Color.MUTED)
+            col_x += col_w
+        y += 24
+        screen.set_clip(old_clip)
+        pygame.draw.line(screen, Color.BORDER, (rect.x + 14, y - 5), (rect.right - 28, y - 5))
+
+        max_rows = max(1, (rect.bottom - y - 62) // 22)
+        max_start = max(0, row_count - max_rows)
+        if preview.follow_latest:
+            preview.scroll = max_start
+        else:
+            preview.scroll = max(0, min(preview.scroll, max_start))
+        start = preview.scroll
+        visible_rows = preview.rows[start:row_count]
+        visible_rows = visible_rows[:max_rows]
+        body_clip = pygame.Rect(rect.x + 16, y - 2, viewport_w, max_rows * 22 + 4)
+        screen.set_clip(body_clip)
+        for row_index, row in enumerate(visible_rows):
+            row_y = y + row_index * 22
+            if (start + row_index) % 2 == 0:
+                stripe = pygame.Rect(rect.x + 10, row_y - 2, rect.w - 40, 20)
+                pygame.draw.rect(screen, Color.FIELD, stripe, border_radius=4)
+            col_x = x
+            for col_index, value in enumerate(row[:col_count]):
+                col_w = col_widths[col_index]
+                label = clipped_text(value, FONT_MONO, col_w - 10)
+                draw_text(label, (col_x, row_y), FONT_MONO, Color.TEXT)
+                col_x += col_w
+        screen.set_clip(old_clip)
+
+        self.draw_preview_scrollbars(rect, row_count, max_rows, start, preview.h_scroll, max_h_scroll)
+        footer = f"{row_count} / {len(preview.rows)} steps"
+        draw_text(footer, (rect.x + 16, rect.bottom - 24), FONT_XS, Color.MUTED)
+
+    def preview_column_widths(self, preview):
+        widths = []
+        for index, header in enumerate(preview.headers):
+            width = max(120, FONT_XS.size(str(header))[0] + 28)
+            for row in preview.rows:
+                if index < len(row):
+                    width = max(width, min(380, FONT_MONO.size(str(row[index]))[0] + 28))
+            widths.append(width)
+        return widths
+
+    def draw_preview_scrollbars(self, rect, row_count, max_rows, start, h_scroll, max_h_scroll):
+        v_track = pygame.Rect(rect.right - 22, rect.y + 38, 8, rect.h - 90)
+        pygame.draw.rect(screen, Color.FIELD, v_track, border_radius=4)
+        pygame.draw.rect(screen, Color.BORDER, v_track, 1, border_radius=4)
+        if row_count <= max_rows:
+            thumb_h = v_track.h
+            thumb_y = v_track.y
+        else:
+            thumb_h = max(28, int(v_track.h * (max_rows / row_count)))
+            thumb_range = max(1, v_track.h - thumb_h)
+            thumb_y = v_track.y + int(thumb_range * (start / max(1, row_count - max_rows)))
+        pygame.draw.rect(screen, Color.SELECT, (v_track.x, thumb_y, v_track.w, thumb_h), border_radius=4)
+
+        h_track = pygame.Rect(rect.x + 16, rect.bottom - 44, rect.w - 54, 8)
+        pygame.draw.rect(screen, Color.FIELD, h_track, border_radius=4)
+        pygame.draw.rect(screen, Color.BORDER, h_track, 1, border_radius=4)
+        if max_h_scroll <= 0:
+            thumb_w = h_track.w
+            thumb_x = h_track.x
+        else:
+            thumb_w = max(36, int(h_track.w * (h_track.w / (h_track.w + max_h_scroll))))
+            thumb_range = max(1, h_track.w - thumb_w)
+            thumb_x = h_track.x + int(thumb_range * (h_scroll / max_h_scroll))
+        pygame.draw.rect(screen, Color.SELECT, (thumb_x, h_track.y, thumb_w, h_track.h), border_radius=4)
+
+    def draw_preview_pixels(self, preview, rect, pixel_count):
+        draw_text("Pixel output", (rect.x + 16, rect.y + 14), FONT_SM, Color.TEXT)
+        draw_text(f"{pixel_count} / {len(preview.pixels)} pixels", (rect.x + 16, rect.y + 38), FONT_XS, Color.MUTED)
+        square_size = min(rect.w - 36, rect.h - 86)
+        viewport = pygame.Rect(0, 0, square_size, square_size)
+        viewport.center = (rect.centerx, rect.y + 68 + square_size // 2)
+        pygame.draw.rect(screen, Color.FIELD, viewport, border_radius=6)
+
+        if not preview.pixels:
+            draw_text("No visible pixels", (viewport.x + 16, viewport.y + 16), FONT_SM, Color.MUTED)
+            return
+
+        xs = [point[0] for point in preview.pixels]
+        ys = [point[1] for point in preview.pixels]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        span_x = max(1, max_x - min_x + 1)
+        span_y = max(1, max_y - min_y + 1)
+        scale = min((viewport.w - 28) / span_x, (viewport.h - 28) / span_y)
+        scale = max(0.05, scale)
+        dot_size = max(1, min(9, int(scale)))
+        drawn_w = span_x * scale
+        drawn_h = span_y * scale
+        origin_x = viewport.centerx - drawn_w / 2
+        origin_y = viewport.centery - drawn_h / 2
+        draw_color = getattr(Color, preview.color_name)
+
+        for x, y in preview.pixels[:pixel_count]:
+            px = int(origin_x + (x - min_x) * scale)
+            py = int(origin_y + (y - min_y) * scale)
+            pygame.draw.rect(screen, draw_color, (px, py, dot_size, dot_size), border_radius=1)
+
 
 class App:
     def __init__(self):
@@ -605,6 +1321,8 @@ class App:
         self.toast_until = 0
         self.show_json = False
         self.show_compare = False
+        self.algorithm_preview = None
+        self.preview_message = None
         self.json_lines = []
         self.compare_lines = []
         self.drawing = DrawingAPI(self)
@@ -648,6 +1366,15 @@ class App:
     def save(self):
         save_shapes(self.shapes)
         self.toast("Saved drawing.json")
+
+    def commit_preview(self):
+        if self.algorithm_preview is None:
+            return
+        shape = self.algorithm_preview.shape
+        message = self.preview_message or "Shape added"
+        self.algorithm_preview = None
+        self.preview_message = None
+        self.drawing.add(shape, message)
 
     def load(self):
         self.shapes = load_shapes()
@@ -700,6 +1427,8 @@ class App:
     def clear(self):
         self.shapes.clear()
         self.pending_points.clear()
+        self.algorithm_preview = None
+        self.preview_message = None
         self.selected_index = None
         self.toast("Canvas cleared")
 
@@ -770,6 +1499,18 @@ class App:
             self.transforms.apply(action)
 
     def handle_key(self, event):
+        if self.algorithm_preview is not None:
+            if event.key == pygame.K_ESCAPE:
+                self.commit_preview()
+            elif event.key == pygame.K_UP:
+                self.scroll_preview(-1)
+            elif event.key == pygame.K_DOWN:
+                self.scroll_preview(1)
+            elif event.key == pygame.K_LEFT:
+                self.scroll_preview_horizontal(-1)
+            elif event.key == pygame.K_RIGHT:
+                self.scroll_preview_horizontal(1)
+            return
         if self.show_json:
             self.show_json = False
             return
@@ -814,6 +1555,14 @@ class App:
             self.dispatch(keymap[event.key])
 
     def handle_mouse(self, event):
+        if self.algorithm_preview is not None:
+            if event.button in (4, 5):
+                direction = 1 if event.button == 5 else -1
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    self.scroll_preview_horizontal(direction)
+                else:
+                    self.scroll_preview(direction)
+            return
         if self.show_json or self.show_compare:
             return
         for button in self.renderer.buttons:
@@ -826,6 +1575,38 @@ class App:
             self.pending_points.append(event.pos)
             self.drawing.finish_if_ready()
 
+    def handle_mousewheel(self, event):
+        if self.algorithm_preview is not None:
+            if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                self.scroll_preview_horizontal(-event.y)
+            else:
+                self.scroll_preview(-event.y)
+
+    def scroll_preview(self, direction):
+        preview = self.algorithm_preview
+        if preview is None:
+            return
+        preview.follow_latest = False
+        now = pygame.time.get_ticks()
+        elapsed = now - preview.started_at
+        row_interval = max(12, min(95, 4000 // max(1, len(preview.rows))))
+        row_count = min(len(preview.rows), max(1, elapsed // row_interval + 1))
+        max_rows = max(1, (HEIGHT - 108 - 76 - 16 - 40 - 40 - 62) // 22)
+        max_start = max(0, row_count - max_rows)
+        preview.scroll = max(0, min(max_start, preview.scroll + direction * 3))
+        if preview.scroll >= max_start:
+            preview.follow_latest = True
+
+    def scroll_preview_horizontal(self, direction):
+        preview = self.algorithm_preview
+        if preview is None:
+            return
+        col_widths = self.renderer.preview_column_widths(preview)
+        content_w = sum(col_widths)
+        viewport_w = 610 - 32 - 16
+        max_h_scroll = max(0, content_w - viewport_w)
+        preview.h_scroll = max(0, min(max_h_scroll, preview.h_scroll + direction * 60))
+
     def run(self):
         running = True
         while running:
@@ -837,6 +1618,8 @@ class App:
                     self.handle_key(event)
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     self.handle_mouse(event)
+                elif event.type == pygame.MOUSEWHEEL:
+                    self.handle_mousewheel(event)
             clock.tick(FPS)
 
 
